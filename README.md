@@ -73,6 +73,21 @@ npm run dev
 | 抽检样本 | `sample_check` | 抽检样本 | 样本编号、关联批次、抽样比例 |
 | 交接包 | `handoff_pack` | 交接包 | 交接编号、关联批次、目标系统 |
 
+## 文件明细与交接确认
+
+采集批次确认和交接打包都以“真实通过完整性校验的文件”为准：
+
+- `GET /api/capture_batch/{id}/manifest`：返回批次的有效文件明细
+  （`files`）与被排除的坏文件（`excluded`），摘要按有效文件重算；
+- `GET /api/handoff_pack/{id}/manifest`：回查交接包发出时的明细与摘要快照，
+  迟到补件后不会被覆盖；
+- `POST /api/capture_batch/{id}/actions {"action":"确认批次"}`：重新取数并按
+  有效文件落确认摘要与明细，坏文件不进入确认集合；
+- `POST /api/handoff_pack/{id}/actions {"action":"确认交接"}`：按清单引用的
+  范围落回执，幂等；同一有效文件跨交接只交付一次，回执写回归集记录与批次。
+
+坏文件保留在归集列表中供复核，但不会计入已接收统计。
+
 ## 约定
 
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。

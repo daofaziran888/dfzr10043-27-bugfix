@@ -150,33 +150,30 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
     """归集流程执行产生的文件，校验后确认采集批次，经字段映射落库并打包交接。"""
     run_entry = _find_entry("flow_run", run_id)
 
-    # 文件归集
+    # 文件归集：先登记再按预期校验值实际比对，坏文件只留痕不入确认集合。
     file_svc = service_for("file_drop")
+    run_code = run_entry.get("执行编号", "")
     collected = []
-    for fp in file_payloads:
+    for index, fp in enumerate(file_payloads, start=1):
+        slot = fp.get("文件槽位") or fp.get("文件名称") or f"file-{index}"
         file_values = {
-            "归集编号": fp.get("归集编号", f"FILE-R{run_id}"),
-            "关联执行": run_entry.get("执行编号", ""),
+            "归集编号": fp.get("归集编号") or f"FILE-R{run_id}-{slot}",
+            "关联执行": run_code,
             "文件名称": fp.get("文件名称", "capture_output.csv"),
             "文件类型": fp.get("文件类型", "text/csv"),
             "字节大小": fp.get("字节大小", "1024"),
-            "校验值": fp.get("校验值", _checksum(fp.get("文件名称", ""))),
+            "校验值": fp.get("校验值", ""),
             "归集目录": fp.get("归集目录", f"/captures/run_{run_id}"),
-            "归集时间": _now_iso(),
+            "文件槽位": fp.get("文件槽位"),
+            "预期校验值": fp.get("预期校验值"),
+            "补报": fp.get("补报", False),
+            "替代文件": fp.get("替代文件", ""),
         }
-        result, _ = file_svc.create_entry(file_values)
-        file_svc.run_action(result["id"], "触发归集")
-        # 校验文件
-        if fp.get("校验值") and fp["校验值"] != _checksum(fp.get("文件名称", "")):
-            file_svc.run_action(result["id"], "校验文件")
-        collected.append(result)
+        collected.append(file_svc.register_file(file_values))
 
     # 创建采集批次
     batch_svc = service_for("capture_batch")
-    batch_payload = "\n".join(
-        fp.get("文件名称", "") for fp in file_payloads
-    )
-    batch_checksum = _checksum(batch_payload)
+    batch_code = f"CAPT-R{run_id}"
 
     # 去重：按采集窗口+上游来源判重，重复批次不落库
     existing = batch_svc.list_entries(size=10000)[0]
@@ -189,18 +186,24 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
         return {"status": "duplicate", "reason": "采集窗口与上游来源重复，批次已存在"}
 
     batch_values = {
-        "批次编号": f"CAPT-R{run_id}",
-        "关联执行": run_entry.get("执行编号", ""),
+        "批次编号": batch_code,
+        "关联执行": run_code,
         "记录行数": str(len(collected)),
         "采集窗口": f"[{_now_iso()[:10]}]",
-        "完整性校验": batch_checksum,
+        "完整性校验": "",
         "批次标签": "file-collect",
         "上游来源": dup_check,
         "生成时间": _now_iso(),
     }
     batch_result, _ = batch_svc.create_entry(batch_values)
-    batch_svc.run_action(batch_result["id"], "启动校验")
-    batch_svc.run_action(batch_result["id"], "确认批次")
+    # 归集记录登记所属批次后，才按真实有效文件取数确认。
+    for entry in collected:
+        entry["关联批次"] = batch_code
+    if batch_result is not None:
+        batch_svc.confirm_batch(batch_result["id"])
+        batch_result = batch_svc.get_entry(batch_result["id"])
+    valid_files = int(batch_result.get("确认文件数", "0") or "0") if batch_result else 0
+    batch_checksum = (batch_result or {}).get("完整性校验", "")
 
     # 字段映射生效
     mapping_svc = service_for("field_mapping")
@@ -208,15 +211,15 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
         mapping_svc.run_action(mid, "提交试算")
         mapping_svc.run_action(mid, "生效映射")
 
-    # 数据落库（含水位推进）
+    # 数据落库（含水位推进）：只按实际确认的有效文件计行数
     landing_svc = service_for("data_landing")
     # 模拟冲突行处理
-    raw_row_count = len(collected) * 10
+    raw_row_count = valid_files * 10
     conflict_rows = max(0, raw_row_count % 3)  # 模拟冲突
     watermark = int(datetime.now(timezone(timedelta(hours=8))).timestamp())
     landing_values = {
         "落库编号": f"LAND-R{run_id}",
-        "关联批次": batch_values["批次编号"],
+        "关联批次": batch_code,
         "目标存储": "datalake_rpa_collect",
         "写入模式": "upsert",
         "写入行数": str(raw_row_count),
@@ -231,29 +234,35 @@ def collect_files_and_land_data(run_id: int, file_payloads: list[dict[str, Any]]
     else:
         landing_svc.run_action(landing_result["id"], "标记异常")
 
-    # 交接包打包
+    # 交接包打包：清单与摘要取自批次确认后的有效文件明细。
     handoff_svc = service_for("handoff_pack")
-    handoff_values = {
-        "交接编号": f"HAND-R{run_id}",
-        "关联批次": batch_values["批次编号"],
-        "目标系统": "datalake_downstream",
-        "清单文件数": str(len(collected)),
-        "记录行数": str(raw_row_count - conflict_rows),
-        "校验摘要": batch_checksum,
-        "交接版本": "v1",
-        "交接时间": _now_iso(),
-    }
-    handoff_result, _ = handoff_svc.create_entry(handoff_values)
-    handoff_svc.run_action(handoff_result["id"], "启动打包")
-    handoff_svc.run_action(handoff_result["id"], "确认交接")
+    confirmed_ids = [
+        int(item.get("file_id", 0))
+        for item in (batch_result or {}).get("有效文件明细", [])
+        if item.get("file_id")
+    ]
+    handoff_result = handoff_svc.open_handoff(
+        batch_code, "datalake_downstream",
+        file_ids=confirmed_ids or None,
+        pack_code=f"HAND-R{run_id}",
+    )
+    handoff_id = handoff_result.get("handoff_id", 0) if handoff_result.get("ok") else 0
+    if handoff_id:
+        handoff_svc.confirm_handoff(handoff_id)
 
     return {
         "status": "landed",
-        "batch_id": batch_result["id"],
+        "batch_id": batch_result["id"] if batch_result else 0,
         "landing_id": landing_result["id"],
-        "handoff_id": handoff_result["id"],
+        "handoff_id": handoff_id,
         "conflict_rows": conflict_rows,
         "watermark": watermark,
+        "valid_file_count": valid_files,
+        "valid_file_ids": [item.get("file_id") for item in
+                           (batch_result or {}).get("有效文件明细", [])],
+        "excluded_file_ids": [item.get("file_id") for item in
+                              (batch_result or {}).get("排除明细", [])],
+        "checksum": batch_checksum,
     }
 
 

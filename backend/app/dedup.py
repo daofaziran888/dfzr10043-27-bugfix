@@ -33,13 +33,16 @@ def is_dirty_row(row: dict[str, Any], required_fields: list[str]) -> bool:
 
 def dedup_by_window(rows: list[dict[str, Any]], key_fields: list[str],
                     window_days: int = 1) -> list[dict[str, Any]]:
-    """按采集窗口去重：相同时窗口内相同键字段的重复行只保留第一条。"""
-    seen: set[str] = set()
-    result = []
+    """按采集窗口去重：同一窗口内相同键字段的重复行只保留第一条。
+
+    窗口锚点取本批数据里最新的生成时间（没有时间字段时退回当前时间），
+    这样同一批数据在任何时候重放都得到相同的判定，不会因为隔天回放
+    就把整批数据判成窗口外而全部丢弃。
+    """
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz)
+    parsed: list[tuple[dict[str, Any], datetime]] = []
     for row in rows:
-        key = "|".join(str(row.get(f, "")) for f in key_fields)
         gen_time = row.get("生成时间", "") or row.get("入队时间", "") or ""
         try:
             row_dt = datetime.fromisoformat(gen_time)
@@ -47,8 +50,19 @@ def dedup_by_window(rows: list[dict[str, Any]], key_fields: list[str],
                 row_dt = row_dt.replace(tzinfo=tz)
         except (ValueError, TypeError):
             row_dt = now
-        in_window = abs((now - row_dt).days) <= window_days
-        if key not in seen and in_window:
+        parsed.append((row, row_dt))
+    anchor = max((dt for _, dt in parsed), default=now)
+
+    seen: set[str] = set()
+    result = []
+    for row, row_dt in parsed:
+        key = "|".join(str(row.get(f, "")) for f in key_fields)
+        in_window = abs((anchor - row_dt).days) <= window_days
+        # 窗口外的行不参与判重，但仍应原样保留，不能被丢弃。
+        if not in_window:
+            result.append(row)
+            continue
+        if key not in seen:
             seen.add(key)
             result.append(row)
     return result

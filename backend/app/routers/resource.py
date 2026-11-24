@@ -73,6 +73,31 @@ def export_entries(
     )
 
 
+@router.get("/{module}/{entry_id}/manifest", response_model=dict)
+def get_manifest(module: str, entry_id: int,
+                 file_ids: str | None = Query(default=None)) -> dict[str, Any]:
+    """查询可交接/已发出的文件明细。
+
+    - capture_batch：按真实已验证文件生成有效文件明细，坏文件只列在 excluded；
+    - handoff_pack：回查发出时的明细与摘要快照（补报后不被覆盖）。
+    """
+    service = require_service(module)
+    scope = [
+        int(part) for part in (file_ids or "").replace(" ", "").split(",")
+        if part.lstrip("-").isdigit()
+    ] or None
+    if module == "capture_batch":
+        if service.get_entry(entry_id) is None:
+            raise HTTPException(status_code=404, detail=f"采集批次 {entry_id} 不存在或已归档")
+        if scope is None:
+            # 页面取明细时顺带刷新一次快照，保证补报后不重复显示。
+            return service.refresh_manifest(entry_id)
+        return service.valid_file_manifest(entry_id, file_ids=scope)
+    if module == "handoff_pack":
+        return service.issued_manifest(entry_id)
+    raise HTTPException(status_code=404, detail=f"模块 {module} 没有文件明细")
+
+
 @router.get("/{module}/{entry_id}", response_model=dict)
 def get_entry(module: str, entry_id: int) -> dict[str, Any]:
     service = require_service(module)

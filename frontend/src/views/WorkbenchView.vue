@@ -60,6 +60,15 @@
             >
               {{ action }}
             </button>
+            <button
+              v-if="supportsManifest"
+              class="link"
+              type="button"
+              :data-testid="`manifest-${row.id}`"
+              @click="openManifest(row)"
+            >
+              查看文件明细
+            </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
@@ -69,6 +78,53 @@
         </tr>
       </tbody>
     </table>
+
+    <div v-if="showManifest" class="modal-backdrop" data-testid="manifest-modal">
+      <div class="modal manifest-modal">
+        <h3>文件明细 · {{ manifestTitle }}</h3>
+        <p class="status-legend">
+          <span>校验摘要：{{ manifest?.checksum || '—' }}</span>
+          <span v-if="manifest?.file_count !== undefined">有效文件：{{ manifest.file_count }}</span>
+          <span v-if="manifest?.excluded?.length">排除文件：{{ manifest.excluded.length }}</span>
+          <span v-if="manifest?.file_count === 0" class="error-text">没有可交接的有效文件</span>
+        </p>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>归集编号</th>
+              <th>文件名称</th>
+              <th>校验结论</th>
+              <th>校验值</th>
+              <th>交付回执</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="file in manifestFiles" :key="String(file.file_id)" :data-testid="`manifest-file-${file.file_id}`">
+              <td>{{ file['归集编号'] ?? '—' }}</td>
+              <td>{{ file['文件名称'] ?? '—' }}</td>
+              <td>{{ file['校验结论'] ?? '—' }}</td>
+              <td>{{ file['校验值'] ?? '—' }}</td>
+              <td>{{ file['交付回执'] || '—' }}</td>
+            </tr>
+            <tr v-for="file in manifestExcluded" :key="`excluded-${String(file.file_id)}`" data-testid="manifest-excluded">
+              <td>{{ file['归集编号'] ?? '—' }}</td>
+              <td>{{ file['文件名称'] ?? '—' }}</td>
+              <td class="error-text">{{ file['校验结论'] ?? '不符' }}</td>
+              <td>{{ file['校验值'] ?? '—' }}</td>
+              <td>—</td>
+            </tr>
+            <tr v-if="!manifestFiles.length && !manifestExcluded.length">
+              <td colspan="5" class="empty-state">暂无文件明细</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="page-actions">
+          <button class="btn" type="button" data-testid="close-manifest" @click="showManifest = false">
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
 
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
@@ -100,9 +156,11 @@ import {
   createEntry,
   downloadEntries,
   listEntries,
+  loadManifest,
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import type { FileManifest } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
@@ -115,6 +173,12 @@ const filterFields = meta.fields.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+const showManifest = ref(false)
+const manifest = ref<FileManifest | null>(null)
+const manifestTitle = ref('')
+const supportsManifest = ['capture_batch', 'handoff_pack'].includes(meta.key)
+const manifestFiles = computed(() => manifest.value?.files ?? [])
+const manifestExcluded = computed(() => manifest.value?.excluded ?? [])
 const stats = computed(() => [
   { label: meta.metrics[0], value: total.value },
   { label: meta.metrics[1], value: rows.value.filter((row) => row.status === meta.statuses[1]).length },
@@ -148,6 +212,20 @@ function openCreate() {
   createValues.value = Object.fromEntries(meta.fields.map((field) => [field, '']))
   errorMessage.value = ''
   showCreate.value = true
+}
+
+async function openManifest(row: EntryRow) {
+  errorMessage.value = ''
+  try {
+    const payload = await loadManifest(meta.key, Number(row.id))
+    manifest.value = payload
+    manifestTitle.value = String(
+      row['批次编号'] ?? row['交接编号'] ?? row.id,
+    )
+    showManifest.value = true
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '文件明细读取失败'
+  }
 }
 
 async function submitCreate() {

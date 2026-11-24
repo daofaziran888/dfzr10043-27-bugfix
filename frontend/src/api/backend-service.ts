@@ -37,6 +37,27 @@ export async function runAction(
   return await response.json()
 }
 
+/** 文件明细：批次的“有效文件明细”或交接包发出/接收时的清单快照。 */
+export type FileManifest = {
+  ok: boolean
+  checksum: string
+  file_count?: number
+  files: Record<string, unknown>[]
+  excluded?: Record<string, unknown>[]
+  [key: string]: unknown
+}
+
+export async function loadManifest(
+  key: string,
+  id: number,
+  fileIds: number[] = [],
+): Promise<FileManifest> {
+  const query = fileIds.length ? `?file_ids=${fileIds.join(',')}` : ''
+  const response = await request(`/api/${key}/${id}/manifest${query}`)
+  if (!response.ok) throw new Error('文件明细读取失败')
+  return await response.json()
+}
+
 export async function downloadEntries(
   key: string,
   filters: Record<string, string> = {},
